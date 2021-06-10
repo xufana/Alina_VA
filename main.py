@@ -1,14 +1,18 @@
 import numpy as np
 import torch
 import torch.nn as nn
-import torchaudio as audio
-import sklearn
+import librosa
 import speech_recognition as sr
 import pyaudio
+from gtts import gTTS
+import os
 import threading
 import wave
+import re
 
 def speech_recog():
+    myobj = gTTS(text='говорите', lang='ru', slow=False).save("wakeup_reaction.mp3")
+    os.system("mpg321 wakeup_reaction.mp3")
 
     mic = sr.Microphone()
     with mic as audio_file:
@@ -23,12 +27,11 @@ def speech_recog():
         phrase = recog.recognize_google(audio, language="ru-RU")
     except:
         print('try again')
-        phrase = speech_recog()
+        phrase = 'error'
 
-    print("Converting Speech to Text...")
     print("You said: " + phrase)
 
-    return phrase
+    #return phrase
 
 class AlinaRNN(nn.Module):
     def __init__(self, code_size, hidden_size):
@@ -54,15 +57,16 @@ class AlinaRNN(nn.Module):
         h = self.rnn(self.encode(x), h)
         return self.decode(h), h
 
+
 net = AlinaRNN(40, 32).float()
 net.load_state_dict(torch.load('model.pt', map_location=torch.device('cpu')))
+
 
 CHUNK = 1024
 FORMAT = pyaudio.paInt16
 CHANNELS = 1
 RATE = 16000
-RECORD_SECONDS = 3
-WAVE_OUTPUT_FILENAME = "output.wav"
+RECORD_SECONDS = 2
 
 p = pyaudio.PyAudio()
 
@@ -72,15 +76,12 @@ stream = p.open(format=FORMAT,
                 input=True,
                 frames_per_buffer=CHUNK)
 
+frames = []
 window_time = 0.01 # seconds
 window_size = int(RATE * window_time)
 
-spectogram = audio.transforms.Spectrogram(
-    n_fft=window_size,
-    win_length=window_size,
-    hop_length=window_size // 2,
-    power=2
-)
+spectrogram = lambda x: torch.tensor(librosa.stft(x.numpy(), n_fft=window_size, win_length=window_size, hop_length=window_size//2)).abs() ** 2
+
 
 print("* recording")
 
@@ -88,36 +89,50 @@ frames = []
 h = torch.zeros(1, 32)
 recog = sr.Recognizer()
 
+j = 0
+
 while True:
-    data = stream.read(CHUNK)
+    data = stream.read(CHUNK, exception_on_overflow = False)
     audio = torch.from_numpy(np.frombuffer(data, dtype=np.int16).astype(np.float32))
-    audio_spec = spectogram(audio)
+    audio_spec = spectrogram(audio)
+    frames.append(data)
+    if len(frames) > 50:
+        frames.pop(0)
 
     net.eval().cpu()
     with torch.no_grad():
         for i, x in list(enumerate(audio_spec[:40, :].T)):
-            pred_word = 0
             prob = 0
             pred, h = net(x.view(1, -1), h)
             if torch.exp(pred[0][1]).item() > 0.95:
-                pred_word = 1
-                print(i, 'ЭТО БЫЛА АЛИНА')
-                speech_recog()
+                print('Alina?')
 
-    frames.append(data)
+                wf = wave.open('check.wav', 'wb')
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(p.get_sample_size(FORMAT))
+                wf.setframerate(RATE)
+                wf.writeframes(b''.join(frames))
+                wf.close()
+
+                AUDIO_FILE = 'check.wav'
+                r = sr.Recognizer()
+                with sr.AudioFile(AUDIO_FILE) as source:
+                    check = r.record(source)
+                    try:
+                        phrase = r.recognize_google(check, language="ru-RU")
+                    except:
+                        phrase = ''
+                    print(phrase)
+                    if not len(re.findall('Алина', phrase)):
+                        break
+                j = 0
+                threading.Thread(target=speech_recog()).setDaemon(True)
+                break
+
+    j += 1
 
 print("* done recording")
 
 stream.stop_stream()
 stream.close()
 p.terminate()
-
-wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
-wf.setnchannels(CHANNELS)
-wf.setsampwidth(p.get_sample_size(FORMAT))
-wf.setframerate(RATE)
-wf.writeframes(b''.join(frames))
-wf.close()
-
-
-
